@@ -13,7 +13,8 @@
     "compile": "tsc --noEmit && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --loader:.node=copy --asset-names=[name] --sourcemap --outfile=out/extension.js",
     "typecheck": "tsc --noEmit",
     "test:integration": "rm -rf out/test && esbuild test/*.test.ts --bundle --platform=node --format=cjs --external:vscode --sourcemap --outdir=out/test && vscode-test",
-    "package": "vsce package --no-dependencies --allow-missing-repository --skip-license -o cabaret.vsix"
+    "package": "vsce package --no-dependencies --allow-missing-repository --skip-license -o cabaret.vsix",
+    "test:navigation": "node --test test/navigation.node.mjs"
   },
   "dependencies": {
     "@cabaret/node": "workspace:*"
@@ -43,6 +44,10 @@
       }
     },
     "commands": [
+      {
+        "command": "cabaret.selectRepository",
+        "title": "Cabaret: Open Worktree"
+      },
       {
         "command": "cabaret.home",
         "title": "Cabaret: Home"

@@ -1,7 +1,9 @@
 mod cabaret;
+mod discovery;
 #[cfg(feature = "napi")]
 mod node;
 
+pub use discovery::discover_repositories;
 pub use cabaret::{Cabaret, Prune, Rebase};
 pub use cabaret_agents::{ClaudeCode, Session, SessionId, Status};
 pub use cabaret_config::{FetchInterval, Hints, Prefix, Scope, Setting};

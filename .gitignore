@@ -1,6 +1,6 @@
 target/
 TODO.md
-node_modules/
+node_modules
 node/index.js
 node/index.d.ts
 node/*.node

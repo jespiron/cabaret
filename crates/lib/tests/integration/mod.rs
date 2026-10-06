@@ -23,3 +23,5 @@ mod sessions;
 mod view_diff;
 mod workspace;
 mod workspace_files;
+
+mod discovery;

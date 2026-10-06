@@ -1,5 +1,6 @@
 import {
   Cabaret,
+  discoverRepositories,
   type ChangedFile,
   type ChangeId,
   type Page,
@@ -17,6 +18,8 @@ import {
   type WorkspaceId,
 } from "@cabaret/node";
 import * as vscode from "vscode";
+import { basename, dirname } from "node:path";
+import { realpathSync } from "node:fs";
 
 // TODO-someday(joel): ensure unicode glyph appearance is okay on linux and windows.
 
@@ -26,23 +29,152 @@ const DESCRIPTION_SCHEME = "cabaret-description";
 /** The language of pages, whose `configurationDefaults` close line gaps in their box drawing. */
 const PAGE_LANGUAGE = "cabaret";
 
-/** The cabaret workspace this window is open on. */
-function workspaceFolder(): vscode.Uri {
-  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (folder === undefined) {
-    throw new Error("no workspace folder open");
+/** Each checkout has its own context; virtual documents carry it in their URI. */
+const repositories = new Map<string, Cabaret>();
+const repositoryPaths = new WeakMap<Cabaret, string>();
+
+function repositoryAt(dir: string): Cabaret {
+  const path = realpathSync(dir);
+  let cabaret = repositories.get(path);
+  if (cabaret === undefined) {
+    cabaret = new Cabaret(path);
+    repositories.set(path, cabaret);
+    repositoryPaths.set(cabaret, path);
   }
-  return folder;
+  return cabaret;
 }
 
-let session: { dir: string; cabaret: Cabaret } | undefined;
+function repositoryPath(cabaret: Cabaret): string {
+  const path = repositoryPaths.get(cabaret);
+  if (path === undefined) throw new Error("repository context is missing");
+  return path;
+}
 
-function openCabaret(): Cabaret {
-  const dir = workspaceFolder().fsPath;
-  if (session?.dir !== dir) {
-    session = { dir, cabaret: new Cabaret(dir) };
+function repositoryQuery(cabaret: Cabaret): string {
+  return new URLSearchParams({ repository: repositoryPath(cabaret) }).toString();
+}
+
+function activeRepositoryUri(): vscode.Uri | undefined {
+  const diff = tabFileDiffs(vscode.window.tabGroups.activeTabGroup.activeTab)[0];
+  return diff?.sides.modified ?? vscode.window.activeTextEditor?.document.uri;
+}
+
+/** Resolve the specific document, never the repository chosen by an earlier command. */
+async function repositoryForUri(uri: vscode.Uri): Promise<Cabaret | undefined> {
+  if ([SCHEME, BLOB_SCHEME, DESCRIPTION_SCHEME].includes(uri.scheme)) {
+    const path = new URLSearchParams(uri.query).get("repository");
+    if (path !== null) return repositoryAt(path);
+    // Old tabs carry no repository identity. Only restore them in an unambiguous checkout.
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 1) {
+      try {
+        return repositoryAt(folders[0]!.uri.fsPath);
+      } catch {
+        /* container */
+      }
+    }
+    throw new Error(
+      "this older Cabaret tab has no repository identity; close it and reopen Cabaret from a worktree file",
+    );
   }
-  return session.cabaret;
+  if (uri.scheme !== "file") return undefined;
+  try {
+    // Git discovery walks upward from the file, never sideways into sibling worktrees.
+    const candidate = new Cabaret(dirname(uri.fsPath));
+    const path = await candidate.workspacePath(await candidate.currentChange());
+    return repositoryAt(path);
+  } catch {
+    return undefined;
+  }
+}
+
+async function repositoryChoices(): Promise<{ label: string; description: string; dir: string }[]> {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const candidates = await Promise.all(folders.map((folder) => discoverRepositories(folder.uri.fsPath)));
+  const grouped = new Map<string, string>();
+  for (const dir of candidates.flat()) grouped.set(repositoryAt(dir).commonDir(), dir);
+  return [...grouped.values()].sort().map((dir) => ({ label: basename(dir), description: dir, dir }));
+}
+
+type WorktreeChoice = vscode.QuickPickItem & {
+  choice: "worktree";
+  dir: string;
+  change?: ChangeId | null;
+};
+
+type ProjectChoice = vscode.QuickPickItem & {
+  choice: "project";
+  worktrees: WorktreeChoice[];
+};
+
+/** Skip project selection for one project; in mixed folders, expand only projects with several worktrees. */
+async function pickWorkspace(): Promise<Cabaret | undefined> {
+  const projects = await Promise.all(
+    (await repositoryChoices()).map(async (repo): Promise<ProjectChoice | WorktreeChoice | undefined> => {
+      const entries = await repositoryAt(repo.dir).workspaceEntries();
+      const worktrees: WorktreeChoice[] = entries.map((entry) => ({
+        choice: "worktree",
+        label: entry.change ?? "(detached HEAD)",
+        description: basename(entry.path),
+        detail: entry.path,
+        dir: entry.path,
+        change: entry.change,
+      }));
+      if (worktrees.length === 0) return undefined;
+      if (worktrees.length === 1) return { ...worktrees[0]!, description: repo.label };
+      return {
+        choice: "project",
+        label: repo.label,
+        description: `${worktrees.length} worktrees`,
+        detail: repo.dir,
+        worktrees,
+      };
+    }),
+  );
+  const choices = projects.filter((item) => item !== undefined);
+  const only = choices.length === 1 ? choices[0] : undefined;
+  const items = only?.choice === "project" ? only.worktrees : choices;
+  const options = { matchOnDescription: true, matchOnDetail: true };
+  const back = { choice: "back" as const, label: "$(arrow-left) Back to projects", alwaysShow: true };
+  while (true) {
+    const selected = await vscode.window.showQuickPick(items, {
+      ...options,
+      title: "Cabaret: Open Worktree",
+      placeHolder:
+        items.length === 0
+          ? "No worktrees found"
+          : only === undefined
+            ? "Choose a project or worktree"
+            : "Choose a worktree to review",
+    });
+    if (selected === undefined) return undefined;
+    let picked: WorktreeChoice;
+    if (selected.choice === "project") {
+      const worktree = await vscode.window.showQuickPick([back, ...selected.worktrees], {
+        ...options,
+        title: `Cabaret: ${selected.label}`,
+        placeHolder: "Choose a worktree to review",
+      });
+      if (worktree === undefined) return undefined;
+      if (worktree.choice === "back") continue;
+      picked = worktree;
+    } else {
+      picked = selected;
+    }
+    if (!picked.change) throw new Error("this worktree has detached HEAD; check out a branch to review its change");
+    return repositoryAt(picked.dir);
+  }
+}
+
+async function ensureRepository(uri: vscode.Uri): Promise<Cabaret> {
+  const cabaret = await repositoryForUri(uri);
+  if (cabaret === undefined) throw new Error("this document does not belong to a Git worktree");
+  return cabaret;
+}
+
+async function showWorkspacePicker(provider: PageProvider): Promise<void> {
+  const cabaret = await pickWorkspace();
+  if (cabaret !== undefined) await provider.open({ kind: "show", change: await cabaret.currentChange() }, cabaret);
 }
 
 /** Every `DiffView`; the `satisfies` stops compiling until a new view is listed here. */
@@ -64,9 +196,9 @@ function isHomeSection(text: string | undefined): text is HomeSection {
 
 type Route = { kind: "home"; section: HomeSection } | { kind: "show" | DiffView; change: ChangeId };
 
-function routeUri(route: Route): vscode.Uri {
+function routeUri(route: Route, cabaret: Cabaret): vscode.Uri {
   const path = `/${route.kind}/${route.kind === "home" ? route.section : route.change}`;
-  return vscode.Uri.from({ scheme: SCHEME, path });
+  return vscode.Uri.from({ scheme: SCHEME, path, query: repositoryQuery(cabaret) });
 }
 
 function parseRoute(uri: vscode.Uri): Route {
@@ -85,9 +217,9 @@ type Location = { kind: "file"; path: RepoPath; line: number };
 
 type Destination = Route | Location;
 
-async function openFile({ path, line }: Location): Promise<void> {
+async function openFile({ path, line }: Location, cabaret: Cabaret): Promise<void> {
   const position = new vscode.Position(line, 0);
-  await vscode.window.showTextDocument(vscode.Uri.joinPath(workspaceFolder(), path), {
+  await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.Uri.file(repositoryPath(cabaret)), path), {
     selection: new vscode.Range(position, position),
   });
 }
@@ -122,20 +254,22 @@ function inserted(page: Page, at: number, insert: Page): Page {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Worktree root") && message.includes("not a directory")
+    ? `${message}. If this worktree was moved, run git -C <main-worktree> worktree repair <new-worktree-path>, then reopen Cabaret.`
+    : message;
 }
 
 /**
  * Fetch from origin every `cabaret.vscode.fetchInterval` seconds, so that others' changes show up
  * without anyone asking; the refs they move refresh the pages.
  */
-function fetchPeriodically(): vscode.Disposable {
+function fetchPeriodically(cabaret: Cabaret): vscode.Disposable {
   let stopped = false;
   let next: NodeJS.Timeout | undefined;
   // An unreachable origin fails every fetch, so report only the first of a run of failures.
   let failing = false;
   const fetch = async () => {
-    const cabaret = openCabaret();
     const seconds = cabaret.fetchInterval();
     if (stopped || seconds === null || !cabaret.hasOrigin()) {
       return;
@@ -314,7 +448,7 @@ class PageProvider
   /** The pages on screen, to tell those coming into view. */
   private onScreen = new Set<string>();
   /** Started with the first page rendered, as a window not on a repository has none to watch or fetch into. */
-  private watcher: vscode.Disposable | undefined;
+  private watchers = new Map<string, vscode.Disposable>();
   /**
    * Where the cursor last was on each page, to put it back on reopening: VS Code reopens a closed
    * page at the top, and Vim keeps its own cursor where it was, so the two disagree otherwise. A
@@ -322,7 +456,7 @@ class PageProvider
    */
   private readonly selections = new Map<string, vscode.Selection>();
   /** The home section last shown, for the way back home to return to. */
-  private homeSection: HomeSection | undefined;
+  private homeSections = new Map<string, HomeSection>();
   private readonly changed = new vscode.EventEmitter<vscode.Uri>();
   private readonly decorations = Object.fromEntries(
     TAGS.map((tag) => [tag, vscode.window.createTextEditorDecorationType(STYLES[tag])]),
@@ -331,7 +465,7 @@ class PageProvider
 
   dispose(): void {
     this.changed.dispose();
-    this.watcher?.dispose();
+    for (const watcher of this.watchers.values()) watcher.dispose();
     for (const decoration of Object.values(this.decorations)) {
       decoration.dispose();
     }
@@ -342,7 +476,7 @@ class PageProvider
 
   /** Home at the section last shown, or before any was, the first with changes in it. */
   async home(cabaret: Cabaret): Promise<Route> {
-    return { kind: "home", section: this.homeSection ?? (await cabaret.firstHomeSection()) };
+    return { kind: "home", section: this.homeSections.get(cabaret.commonDir()) ?? (await cabaret.firstHomeSection()) };
   }
 
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
@@ -360,23 +494,29 @@ class PageProvider
 
   /** The page `uri` now shows in the repository, without its sessions. */
   private async render(uri: vscode.Uri): Promise<Page> {
+    const cabaret = await ensureRepository(uri);
     const route = parseRoute(uri);
     if (route.kind === "home") {
-      this.homeSection = route.section;
+      this.homeSections.set(cabaret.commonDir(), route.section);
     }
-    this.watcher ??= vscode.Disposable.from(this.watchRepository(), fetchPeriodically());
-    return renderRoute(openCabaret(), route);
+    if (!this.watchers.has(cabaret.commonDir())) {
+      this.watchers.set(
+        cabaret.commonDir(),
+        vscode.Disposable.from(this.watchRepository(cabaret), fetchPeriodically(cabaret)),
+      );
+    }
+    return renderRoute(cabaret, route);
   }
 
   /**
    * Refresh open pages whenever the repository's refs move, which every change to what they show
    * does, from this window or elsewhere.
    */
-  private watchRepository(): vscode.Disposable {
+  private watchRepository(cabaret: Cabaret): vscode.Disposable {
     // TODO-someday(joel): uncommitted edits move no ref, so the workspace page of a workspace no
     // window saves into waits to come into view.
     const refs = new vscode.RelativePattern(
-      vscode.Uri.file(openCabaret().commonDir()),
+      vscode.Uri.file(cabaret.commonDir()),
       "{HEAD,packed-refs,refs/**,worktrees/*/HEAD}",
     );
     const watcher = vscode.workspace.createFileSystemWatcher(refs);
@@ -468,7 +608,7 @@ class PageProvider
     if (route.kind !== "show") {
       return;
     }
-    const tail = await sessionsPage(openCabaret(), route.change);
+    const tail = await sessionsPage(await ensureRepository(uri), route.change);
     await this.update(uri, async () => {
       if (this.served.get(uri.toString())?.base === base) {
         await this.serve(uri, { base, tail });
@@ -505,14 +645,15 @@ class PageProvider
     }
   }
 
-  provideDocumentLinks(document: vscode.TextDocument): vscode.DocumentLink[] {
+  async provideDocumentLinks(document: vscode.TextDocument): Promise<vscode.DocumentLink[]> {
     const page = this.page(document.uri);
     if (page === undefined) {
       return [];
     }
+    const cabaret = await ensureRepository(document.uri);
     return [...placed(page)].flatMap(({ segment, range }) => {
       const route = targetRoute(segment.target);
-      return route === undefined ? [] : [new vscode.DocumentLink(range, openPageUri(route))];
+      return route === undefined ? [] : [new vscode.DocumentLink(range, openPageUri(route, cabaret))];
     });
   }
 
@@ -562,8 +703,8 @@ class PageProvider
   }
 
   /** Re-render `route` from the repository and show it. */
-  async open(route: Route): Promise<void> {
-    const uri = routeUri(route);
+  async open(route: Route, cabaret: Cabaret): Promise<void> {
+    const uri = routeUri(route, cabaret);
     // A page not yet open is rendered as it opens, and its sessions listed as it comes into view.
     if (openDocument(uri) !== undefined) {
       await this.refresh(uri);
@@ -576,11 +717,11 @@ class PageProvider
     });
   }
 
-  async show(destination: Destination): Promise<void> {
+  async show(destination: Destination, cabaret: Cabaret): Promise<void> {
     if (destination.kind === "file") {
-      await openFile(destination);
+      await openFile(destination, cabaret);
     } else {
-      await this.open(destination);
+      await this.open(destination, cabaret);
     }
   }
 }
@@ -599,8 +740,9 @@ type FilesDiff = Omit<FileDiff, "path"> & { paths: [RepoPath, ...RepoPath[]] };
  * text at `blobPath` in that revision, or empty with no revision, as one side of the file diff the
  * query names. The blob's own path differs from the diff's for the before side of a rename.
  */
-function blobUri(diff: FileDiff, revision: RevisionId | undefined, blobPath: RepoPath): vscode.Uri {
+function blobUri(diff: FileDiff, revision: RevisionId | undefined, blobPath: RepoPath, cabaret: Cabaret): vscode.Uri {
   const query = new URLSearchParams(diff);
+  query.set("repository", repositoryPath(cabaret));
   if (revision !== undefined) {
     query.set("revision", revision);
   }
@@ -620,13 +762,13 @@ function blobFileDiff(uri: vscode.Uri): FileDiff {
 class BlobProvider implements vscode.TextDocumentContentProvider {
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
     const revision = new URLSearchParams(uri.query).get("revision");
-    return revision === null ? "" : ((await openCabaret().blob(revision, uri.path.slice(1))) ?? "");
+    return revision === null ? "" : ((await (await ensureRepository(uri)).blob(revision, uri.path.slice(1))) ?? "");
   }
 }
 
 /** `cabaret-description:/<change>.md`: the change's description, as markdown. */
-function descriptionUri(change: ChangeId): vscode.Uri {
-  return vscode.Uri.from({ scheme: DESCRIPTION_SCHEME, path: `/${change}.md` });
+function descriptionUri(change: ChangeId, cabaret: Cabaret): vscode.Uri {
+  return vscode.Uri.from({ scheme: DESCRIPTION_SCHEME, path: `/${change}.md`, query: repositoryQuery(cabaret) });
 }
 
 function descriptionChange(uri: vscode.Uri): ChangeId {
@@ -654,14 +796,14 @@ class DescriptionProvider implements vscode.FileSystemProvider {
   }
 
   async readFile(uri: vscode.Uri): Promise<Uint8Array> {
-    const { description } = await openCabaret().change(descriptionChange(uri));
+    const { description } = await (await ensureRepository(uri)).change(descriptionChange(uri));
     return Buffer.from(description ?? "");
   }
 
   async writeFile(uri: vscode.Uri, content: Uint8Array): Promise<void> {
     const change = descriptionChange(uri);
     const text = Buffer.from(content).toString();
-    await openCabaret().setDescription(change, text.trim() === "" ? undefined : text);
+    await (await ensureRepository(uri)).setDescription(change, text.trim() === "" ? undefined : text);
   }
 
   readDirectory(): never {
@@ -699,7 +841,7 @@ async function fileDiffSides(
   return diffs.map(({ file, before, after }) => {
     const diff: FileDiff = { view, change, path: file.path, tip };
     const from = "from" in file ? file.from : file.path;
-    return { before: blobUri(diff, before, from), after: blobUri(diff, after, file.path) };
+    return { before: blobUri(diff, before, from, cabaret), after: blobUri(diff, after, file.path, cabaret) };
   });
 }
 
@@ -747,8 +889,8 @@ async function openFileDiffs(cabaret: Cabaret, view: DiffView, change: ChangeId,
  * A link opening `route` through `cabaret.openPage`, so that a click replaces the page as Enter
  * does rather than opening beside it.
  */
-function openPageUri(route: Route): vscode.Uri {
-  const query = JSON.stringify([routeUri(route).toString()]);
+function openPageUri(route: Route, cabaret: Cabaret): vscode.Uri {
+  const query = JSON.stringify([routeUri(route, cabaret).toString()]);
   return vscode.Uri.from({ scheme: "command", path: "cabaret.openPage", query });
 }
 
@@ -769,13 +911,13 @@ function targetRoute(target: Target | undefined): Route | undefined {
 async function follow(cabaret: Cabaret, provider: PageProvider, target: Target): Promise<void> {
   switch (target.kind) {
     case "Change":
-      await provider.open({ kind: "show", change: target.change });
+      await provider.open({ kind: "show", change: target.change }, cabaret);
       break;
     case "Files":
-      await provider.open({ kind: target.view, change: target.change });
+      await provider.open({ kind: target.view, change: target.change }, cabaret);
       break;
     case "Home":
-      await provider.open({ kind: "home", section: target.section });
+      await provider.open({ kind: "home", section: target.section }, cabaret);
       break;
     case "Diff":
       await openFileDiffs(cabaret, target.view, target.change, target.files);
@@ -784,7 +926,7 @@ async function follow(cabaret: Cabaret, provider: PageProvider, target: Target):
       await editTitle(cabaret, provider, target.change);
       break;
     case "Description":
-      await editDescription(target.change);
+      await editDescription(target.change, cabaret);
       break;
     case "Session":
       await openSession(cabaret, target.change, target.session);
@@ -792,8 +934,8 @@ async function follow(cabaret: Cabaret, provider: PageProvider, target: Target):
   }
 }
 
-async function editDescription(change: ChangeId): Promise<void> {
-  await vscode.window.showTextDocument(descriptionUri(change));
+async function editDescription(change: ChangeId, cabaret: Cabaret): Promise<void> {
+  await vscode.window.showTextDocument(descriptionUri(change, cabaret));
 }
 
 /** Titles are one line, so they are edited in an input box rather than a buffer like descriptions. */
@@ -914,10 +1056,10 @@ async function enclosing(route: Route, home: () => Promise<Route>): Promise<Rout
 
 /**
  * The change the active file diff or page is about, or a workspace file's checked-out one; where
- * nothing on screen implies a change, one picked by the user, undefined if they decline.
+ * nothing on screen implies a change, the checkout chosen by the command resolver.
  */
 async function activeChange(cabaret: Cabaret, provider: PageProvider): Promise<ChangeId | undefined> {
-  return (await impliedChange(cabaret, provider)) ?? pickChange(cabaret, "Cabaret: Choose Change");
+  return (await impliedChange(cabaret, provider)) ?? cabaret.currentChange();
 }
 
 /** A new change with no parent in view most often wants to start off trunk, so skip the picker. */
@@ -940,7 +1082,19 @@ async function impliedChange(cabaret: Cabaret, provider: PageProvider): Promise<
   if (editor.document.uri.scheme === DESCRIPTION_SCHEME) {
     return descriptionChange(editor.document.uri);
   }
-  return vscode.workspace.getWorkspaceFolder(editor.document.uri) === undefined ? undefined : cabaret.currentChange();
+  if (editor.document.uri.scheme !== "file") {
+    return undefined;
+  }
+  let fileRepository: Cabaret;
+  try {
+    fileRepository = new Cabaret(dirname(editor.document.uri.fsPath));
+  } catch {
+    return undefined;
+  }
+  if (fileRepository.commonDir() !== cabaret.commonDir()) {
+    return undefined;
+  }
+  return fileRepository.currentChange();
 }
 
 /** `run` on the change the active page is about, or one the user picks; nothing if they decline. */
@@ -982,12 +1136,14 @@ async function switchView(cabaret: Cabaret, provider: PageProvider, view: Commit
         3000,
       );
     }
-    await (files.length === 0 ? provider.open({ kind: view, change }) : openFileDiffs(cabaret, view, change, files));
+    await (files.length === 0
+      ? provider.open({ kind: view, change }, cabaret)
+      : openFileDiffs(cabaret, view, change, files));
     return;
   }
   const change = await activeChange(cabaret, provider);
   if (change !== undefined) {
-    await provider.open({ kind: view, change });
+    await provider.open({ kind: view, change }, cabaret);
   }
 }
 
@@ -1047,13 +1203,13 @@ async function step(cabaret: Cabaret, provider: PageProvider, direction: Directi
   }
   const route = parseRoute(editor.document.uri);
   if (route.kind !== "home") {
-    await provider.open({ ...route, change: to });
+    await provider.open({ ...route, change: to }, cabaret);
     return;
   }
   const page = provider.page(editor.document.uri);
   const row = page === undefined ? undefined : rowOf(page, to);
   if (row === undefined) {
-    await provider.open({ kind: "show", change: to });
+    await provider.open({ kind: "show", change: to }, cabaret);
     return;
   }
   const position = editor.document.validatePosition(new vscode.Position(row, editor.selection.active.character));
@@ -1090,8 +1246,22 @@ async function reporting(run: () => Promise<void>): Promise<void> {
   }
 }
 
-function command(name: string, run: (cabaret: Cabaret) => Promise<void>): vscode.Disposable {
-  return vscode.commands.registerCommand(name, () => reporting(() => run(openCabaret())));
+function command(name: string, run: (cabaret: Cabaret) => Promise<void>, checkoutFallback = false): vscode.Disposable {
+  return vscode.commands.registerCommand(name, () =>
+    reporting(async () => {
+      const uri = activeRepositoryUri();
+      let cabaret = uri === undefined ? undefined : await repositoryForUri(uri);
+      if (cabaret === undefined && checkoutFallback && vscode.workspace.workspaceFolders?.length === 1) {
+        try {
+          cabaret = repositoryAt(vscode.workspace.workspaceFolders[0]!.uri.fsPath);
+        } catch {
+          /* container */
+        }
+      }
+      cabaret ??= await pickWorkspace();
+      if (cabaret !== undefined) await run(cabaret);
+    }),
+  );
 }
 
 /**
@@ -1123,14 +1293,14 @@ async function takeHandoff(context: vscode.ExtensionContext, provider: PageProvi
   if (vscode.workspace.workspaceFolders === undefined) {
     return;
   }
-  const dir = workspaceFolder().fsPath;
+  const dir = vscode.workspace.workspaceFolders[0]!.uri.fsPath;
   const handoff = context.globalState.get<Handoff>(handoffKey(dir));
   if (handoff === undefined) {
     return;
   }
   await context.globalState.update(handoffKey(dir), undefined);
   if (Date.now() - handoff.at < HANDOFF_TTL) {
-    await provider.show(handoff.destination);
+    await provider.show(handoff.destination, repositoryAt(dir));
   }
 }
 
@@ -1167,7 +1337,7 @@ async function gotoWorkspace(
   }
   if (workspace.kind === "Here") {
     if (destination !== undefined) {
-      await provider.show(destination);
+      await provider.show(destination, cabaret);
     }
   } else {
     await openWorkspace(context, workspace.path, destination);
@@ -1214,7 +1384,7 @@ async function enterFile(context: vscode.ExtensionContext, cabaret: Cabaret, fil
     return;
   }
   if (workspace.kind === "Here") {
-    await openFile(location);
+    await openFile(location, cabaret);
   } else {
     await openWorkspace(context, workspace.path, location);
   }
@@ -1246,7 +1416,9 @@ async function markFiles(
   );
   const unreviewed = new Set((await cabaret.viewFiles(change, "review")).map((file) => file.path));
   const next = files[index + 1] ?? files.find((file) => unreviewed.has(file.path));
-  await (next === undefined ? provider.open({ kind: view, change }) : openFileDiff(cabaret, view, change, next));
+  await (next === undefined
+    ? provider.open({ kind: view, change }, cabaret)
+    : openFileDiff(cabaret, view, change, next));
 }
 
 /** `! m` on a diff or review page: record the selected files as reviewed up to the change's tip. */
@@ -1402,7 +1574,7 @@ function action(
     }
     const { report, show } = typeof outcome === "string" ? { report: outcome, show: undefined } : outcome;
     vscode.window.showInformationMessage(`Cabaret: ${report}`);
-    await (show === undefined ? provider.refreshOpen() : provider.open(show));
+    await (show === undefined ? provider.refreshOpen() : provider.open(show, cabaret));
   });
 }
 
@@ -1893,6 +2065,25 @@ async function discardSelected(
   return `discarded ${paths} from ${change}`;
 }
 
+/** Escape walks out of a diff, then opens the worktree picker from an overview. */
+async function stepOut(cabaret: Cabaret, provider: PageProvider): Promise<void> {
+  const filesDiff = activeFilesDiff();
+  if (filesDiff !== undefined) {
+    await provider.open({ kind: filesDiff.view, change: filesDiff.change }, cabaret);
+    return;
+  }
+  const editor = activePage();
+  if (editor !== undefined && ["show", "home"].includes(parseRoute(editor.document.uri).kind)) {
+    await showWorkspacePicker(provider);
+    return;
+  }
+  const out =
+    editor === undefined ? undefined : await enclosing(parseRoute(editor.document.uri), () => provider.home(cabaret));
+  if (out !== undefined) {
+    await provider.open(out, cabaret);
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const provider = new PageProvider();
   for (const document of vscode.workspace.textDocuments) {
@@ -1949,17 +2140,26 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.onDidChangeActiveTextEditor(updatePageContext),
     vscode.window.tabGroups.onDidChangeTabs(updatePageContext),
     vscode.commands.registerCommand("cabaret.openPage", (uri: string) =>
-      reporting(() => provider.open(parseRoute(vscode.Uri.parse(uri)))),
+      reporting(async () =>
+        provider.open(parseRoute(vscode.Uri.parse(uri)), await ensureRepository(vscode.Uri.parse(uri))),
+      ),
     ),
-    command("cabaret.home", async (cabaret) => {
-      await provider.open(await provider.home(cabaret));
-    }),
-    onChange("cabaret.showChange", provider, (_, change) => provider.open({ kind: "show", change })),
+    vscode.commands.registerCommand("cabaret.selectRepository", () => reporting(() => showWorkspacePicker(provider))),
+    command(
+      "cabaret.home",
+      async (cabaret) => {
+        await provider.open(await provider.home(cabaret), cabaret);
+      },
+      true,
+    ),
+    onChange("cabaret.showChange", provider, (cabaret, change) => provider.open({ kind: "show", change }, cabaret)),
     command("cabaret.diff", (cabaret) => switchView(cabaret, provider, "diff")),
     command("cabaret.review", (cabaret) => switchView(cabaret, provider, "review")),
-    onChange("cabaret.workspaceDiff", provider, (_, change) => provider.open({ kind: "workspace", change })),
+    onChange("cabaret.workspaceDiff", provider, (cabaret, change) =>
+      provider.open({ kind: "workspace", change }, cabaret),
+    ),
     onChange("cabaret.editTitle", provider, (cabaret, change) => editTitle(cabaret, provider, change)),
-    onChange("cabaret.editDescription", provider, (_, change) => editDescription(change)),
+    onChange("cabaret.editDescription", provider, (cabaret, change) => editDescription(change, cabaret)),
     // Enter: follow whatever the cursor is on, or diff the files selected on a view's page all at
     // once; on a file diff, into the file itself.
     command("cabaret.stepIn", async (cabaret) => {
@@ -1978,28 +2178,15 @@ export function activate(context: vscode.ExtensionContext) {
         await follow(cabaret, provider, target);
       }
     }),
-    // Escape: out one scope, a file diff into the view it came from.
-    command("cabaret.stepOut", async (cabaret) => {
-      const filesDiff = activeFilesDiff();
-      if (filesDiff !== undefined) {
-        await provider.open({ kind: filesDiff.view, change: filesDiff.change });
-        return;
-      }
-      const editor = activePage();
-      const out =
-        editor === undefined
-          ? undefined
-          : await enclosing(parseRoute(editor.document.uri), () => provider.home(cabaret));
-      if (out !== undefined) {
-        await provider.open(out);
-      }
-    }),
+    command("cabaret.stepOut", (cabaret) => stepOut(cabaret, provider)),
     command("cabaret.refresh", () => provider.refreshOpen()),
     // `! m`: mark reviewed what is on screen, a file diff or the files selected on a page. The
     // title bar button passes its diff, whose group a click leaves unfocused.
     vscode.commands.registerCommand("cabaret.mark", (clicked?: vscode.Uri) =>
       reporting(async () => {
-        const cabaret = openCabaret();
+        const uri = clicked ?? activeRepositoryUri();
+        if (uri === undefined) return;
+        const cabaret = await ensureRepository(uri);
         const active = tabFileDiffs(vscode.window.tabGroups.activeTabGroup.activeTab);
         if (clicked !== undefined && !active.some(({ sides }) => sides.modified.toString() === clicked.toString())) {
           throw new Error("focus the diff to mark it");

@@ -61,7 +61,7 @@ suite("workflows", () => {
       ["cabaret.stepDown"],
       ["cabaret.stepOut"],
       ["cabaret.stepOut"],
-      ["cabaret.stepOut"],
+      ["cabaret.home"],
     ]);
     assert.equal(
       actual,
@@ -86,7 +86,7 @@ cabaret.stepOut
 cabaret.stepOut
   > feature
   cabaret:/show/feature:0: feature
-cabaret.stepOut
+cabaret.home
   > review
   cabaret:/home/review:4: ○   feature
 `,

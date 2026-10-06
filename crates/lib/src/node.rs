@@ -109,6 +109,13 @@ fn path_string(path: PathBuf) -> Result<String> {
     path.into_os_string().into_string().map_err(|path| format!("{} is not UTF-8", PathBuf::from(path).display()).into())
 }
 
+/// A registered checkout and its branch, absent for detached HEAD.
+#[napi(object)]
+pub struct WorkspaceEntry {
+    pub path: String,
+    pub change: Option<ChangeId>,
+}
+
 #[napi(js_name = "Cabaret")]
 pub struct CabaretJs {
     cabaret: Arc<Cabaret>,
@@ -229,6 +236,16 @@ impl CabaretJs {
         self.blocking(move |cabaret| cabaret.view_diff(&change, view, &pathspecs)).await
     }
 
+    /// All checkouts of this repository, including those outside the opened folder.
+    #[napi]
+    pub async fn workspace_entries(&self) -> napi::Result<Vec<WorkspaceEntry>> {
+        self.blocking(|cabaret| {
+            cabaret.workspaces()?.into_iter().map(|(workspace, change)| {
+                Ok(WorkspaceEntry { path: path_string(cabaret.workspace_path(workspace.to_ref())?)?, change })
+            }).collect()
+        }).await
+    }
+
     /// Create a workspace holding `change` at the default location, returning its path.
     #[napi]
     pub async fn workspace_add(&self, change: ChangeId) -> napi::Result<String> {
@@ -271,7 +288,11 @@ impl CabaretJs {
     pub async fn fetch(&self) -> napi::Result<()> { self.blocking(|cabaret| cabaret.fetch().map(drop)).await }
 
     #[napi]
-    pub fn common_dir(&self) -> napi::Result<String> { Ok(path_string(self.cabaret.common_dir())?) }
+    pub fn common_dir(&self) -> napi::Result<String> {
+        let path = std::fs::canonicalize(self.cabaret.common_dir())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+        Ok(path_string(path)?)
+    }
 
     #[napi]
     pub async fn workspace_path(&self, change: ChangeId) -> napi::Result<String> {
@@ -444,4 +465,13 @@ impl CabaretJs {
             Err(refused) => Rebased::Refused { safeguards: presented(refused) },
         })
     }
+}
+
+/// Discover repositories in a checkout or a directory holding sibling worktrees, off the UI thread.
+#[napi]
+pub async fn discover_repositories(dir: String) -> napi::Result<Vec<String>> {
+    spawn_blocking(move || crate::discover_repositories(std::path::Path::new(&dir))?
+        .into_iter().map(path_string).collect::<Result<Vec<_>>>())
+        .await.map_err(|error| napi::Error::from_reason(format!("{error:?}")))?
+        .map_err(|error| napi::Error::from_reason(format!("{error:?}")))
 }

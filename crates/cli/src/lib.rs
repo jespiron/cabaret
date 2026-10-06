@@ -50,13 +50,28 @@ enum Command {
 #[derive(Parser)]
 #[command(name = "cab", version, about = "Cabaret Code Review")]
 pub struct Cli {
+    /// Run in this checkout or repository container.
+    #[arg(short = 'C', global = true, value_hint = ValueHint::DirPath)]
+    directory: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let cabaret = || Cabaret::open(std::env::current_dir()?);
+    if let Some(dir) = cli.directory {
+        std::env::set_current_dir(dir)?;
+    }
+    let cabaret = || {
+        let dir = std::env::current_dir()?;
+        let repositories = cabaret_lib::discover_repositories(&dir)?;
+        match repositories.as_slice() {
+            [repository] => Cabaret::open(repository),
+            [] => Err(format!("no Git repository found in {} or its immediate children", dir.display()).into()),
+            _ => Err(format!("multiple repositories found; choose one with cab -C <path>:\n{}",
+                repositories.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("\n")).into()),
+        }
+    };
 
     match cli.command {
         Command::Change { command } => command.run(&cabaret()?)?,
